@@ -1,6 +1,6 @@
 # ARCHITECTURE.md — Eldercare Coordination App
 
-_Last updated: Session 1_
+_Last updated: Session 2 (complete)_
 
 ## What this app is
 A Taiwan-focused family elder-care coordination app. Adult children
@@ -10,37 +10,36 @@ coordinate care for elderly parents; parents interact via LINE
 ## Stack
 - **Framework**: Next.js (App Router, TypeScript), deployed on Vercel
 - **Database**: Neon Postgres (serverless), accessed via `@neondatabase/serverless`
-  — no ORM. Pattern: a single `queryUnsafe(sql, params)` helper in `lib/db.ts`
-  that returns rows as a plain array (not `.rows`), matching the
-  TaiwanScreen project's convention.
-- **Parent-facing / notifications**: LINE Messaging API + LIFF
+  v1.x — no ORM. Pattern: a single `queryUnsafe(sql, params)` helper in
+  `lib/db.ts` that returns rows as a plain array (not `.rows`).
+- **Parent-facing / notifications**: LINE Messaging API + LIFF (Phase 2,
+  needs its own separate LINE channel — see note below)
 - **Payments**: NewebPay
-- **Dev workflow**: TRANSITIONING — see "Dev workflow decision" below.
-  Session 1 was built entirely through GitHub's web UI (Add file → Create
-  new file → paste → commit), with no local dev environment. Starting
-  Session 2, the plan is to switch to a local VS Code + Git setup instead.
+- **Dev workflow**: VS Code locally + PowerShell (`git add`, `git commit`,
+  `git push`) → GitHub → Vercel auto-deploy.
+- **Repo**: public at github.com/verymeanguy13-lab/eldercare-app — Claude
+  can browse this directly in future sessions to verify file contents,
+  though it can only fetch a URL already surfaced in the conversation (a
+  search result or a link already seen), not guess a file path cold.
 
-## Dev workflow decision (flag for next session)
-During Session 1, it became clear the original blueprint's assumption
-("no local dev environment, GitHub web UI only") no longer matches
-reality — the person has prior VS Code + Git + Vercel experience from other
-projects. Session 1 was completed via the web UI to avoid a messy
-half-and-half session, but Session 2 should start with a short VS Code
-setup walkthrough (installing Node.js and Git, cloning this repo locally,
-running npm install, and how to commit/push from VS Code) before any new
-feature work begins.
-
-Action needed on the master blueprint document (outside of any Claude
-session — this can't be carried automatically): the Standing Context Block
-sentence "I manage code entirely through GitHub's web interface — no local
-dev environment, no Claude Code, I am not an experienced developer" should
-be replaced with something like "I code locally using VS Code with Git,
-and push to GitHub from there. I'm still relatively new to this — explain
-commands before I run them, and give me full file contents rather than
-partial diffs." A few session-specific "Steps to do yourself" sections
-elsewhere in the blueprint (e.g. Session 6.5's staging branch instructions)
-were also written assuming the GitHub web UI and may need light adjustment
-once on VS Code — not urgent, but worth a glance when reached.
+## Data model (Session 2)
+- **`circles`** — one row per family. Holds `tier` (`free`/`paid`) from
+  day one so freemium gating (Session 24) never needs a schema migration
+  to add it.
+- **`members`** — one row per real person using the app (not the cared-for
+  elder — they interact via LINE in Phase 2, not as a `member` row).
+- **`cared_for_profiles`** — one row per elderly person being cared for.
+  Modeled as its own table (not a column on `circles`) specifically so one
+  circle can hold MULTIPLE cared-for people (e.g. both parents) without
+  any future restructuring.
+- **`circle_memberships`** — join table connecting members to circles,
+  one row per (circle, member) pair, carrying a `role`
+  (admin/family_member/caregiver/viewer). This is what allows a person to
+  belong to more than one circle, and a circle to have members with
+  different permission levels.
+- Every circle-scoped table carries a `circle_id` column so row-level
+  scoping can be enforced consistently everywhere (in application code now;
+  Session 2.5 adds a database-level backstop via Postgres RLS).
 
 ## Repo structure so far
 - app/layout.tsx — root layout (html/body wrapper)
@@ -50,78 +49,106 @@ once on VS Code — not urgent, but worth a glance when reached.
 - schema.sql — full current DB schema (source of truth)
 - ARCHITECTURE.md — this file
 - .env.example — documents required env vars (no real secrets)
+- .env.local — real local secrets (gitignored, never committed)
 - .gitignore
 - next.config.mjs
 - package.json
 - tsconfig.json
-- README.md — created by GitHub at repo creation; unused so far
+- README.md
 
 ## Conventions to keep consistent in every future session
 - DB access: always through queryUnsafe() from lib/db.ts. Always use
-  parameterized queries ($1, $2, ...) — never string-concatenate
-  user input into SQL.
-- Components: default to Server Components. Only add 'use client'
-  when a file genuinely needs browser interactivity (state, event handlers).
-- File delivery: every session, only files that changed are given in
-  full; unrelated files are left untouched and unmentioned.
+  parameterized queries ($1, $2, ...) — never string-concatenate user
+  input into SQL.
+- Components: default to Server Components. Only add 'use client' when a
+  file genuinely needs browser interactivity.
+- File delivery: every session, only files that changed are given in full.
 - Path alias: @/ maps to the repo root (e.g. @/lib/db).
+- Non-string/number values returned from Postgres (e.g. Date objects) must
+  be explicitly converted (String(value)) before being rendered in JSX.
+- Every circle-scoped table needs a circle_id column — this is the
+  enforcement seam every permission check in the app will rely on.
+- Primary keys are UUIDs (gen_random_uuid()) throughout, not serial
+  integers — avoids leaking row counts/order and matches typical
+  multi-tenant SaaS practice.
 
-## Environment variables (set in Vercel, not committed)
-| Variable | Purpose |
-|---|---|
-| NEON_DATABASE_URL | Neon Postgres pooled connection string |
-| LINE_CHANNEL_SECRET | LINE channel secret (webhook signature verification) |
-| LINE_CHANNEL_ACCESS_TOKEN | LINE channel access token (sending messages) |
-| NEWEBPAY_MERCHANT_ID | NewebPay merchant ID |
-| NEWEBPAY_HASH_KEY | NewebPay hash key (payment signing) |
-| NEWEBPAY_HASH_IV | NewebPay hash IV (payment signing) |
+## Environment variables
+| Variable | Where it lives | Purpose |
+|---|---|---|
+| `NEON_DATABASE_URL` | Vercel env vars + `.env.local` | Neon Postgres connection string |
+| `LINE_CHANNEL_SECRET` | same | LINE channel secret (Session 13+) |
+| `LINE_CHANNEL_ACCESS_TOKEN` | same | LINE channel access token (Session 13+) |
+| `NEWEBPAY_MERCHANT_ID` | same | NewebPay merchant ID (Session 23+) |
+| `NEWEBPAY_HASH_KEY` | same | NewebPay hash key (Session 23+) |
+| `NEWEBPAY_HASH_IV` | same | NewebPay hash IV (Session 23+) |
+
+## LINE channel note (relevant from Session 13 onward)
+This app needs its OWN separate LINE Provider + Messaging API channel,
+distinct from other existing projects. No action needed until Session 13.
 
 ## Design decisions & reasoning
-- No ORM: chosen for consistency with the existing TaiwanScreen project
-  and to keep the mental model simple for a beginner maintaining raw SQL
-  directly. Trade-off: no compile-time schema safety, no migrations tool —
-  schema.sql is manually kept in sync and is the single source of truth.
-- @neondatabase/serverless over pg: works over HTTP, which fits
-  Vercel's serverless/edge functions without connection-pooling headaches
-  that a traditional TCP driver would hit in a serverless environment.
-- force-dynamic on the homepage: without it, Next.js could statically
-  render the page at build time and freeze the DB timestamp instead of
-  querying live. Any future page that reads live DB data should also set
-  this (or use another dynamic API like cookies()/headers()) unless
-  static rendering is intentional.
+- **No ORM**: consistency with the existing TaiwanScreen project; simpler
+  mental model. Trade-off: schema.sql is manually kept in sync, no
+  compile-time schema safety.
+- **@neondatabase/serverless over pg**: works over HTTP, fits Vercel's
+  serverless functions.
+- **force-dynamic on pages reading live DB data**: prevents Next.js from
+  caching a stale snapshot at build time.
+- **cared_for_profiles as its own table, not a column on circles**: the
+  whole point is supporting multiple cared-for people per circle from day
+  one — retrofitting this later would mean a real migration, not a
+  addition, so it's built correctly now while the schema is still small.
+- **tier column on circles from Session 2, not deferred**: the product's
+  whole monetization model (Session 24) is usage-based freemium gating,
+  which needs a place to check "is this circle paid" from the very first
+  feature that enforces a cap (Session 3's member-join flow). Adding it
+  now avoids a migration later.
+- **UUID primary keys via pgcrypto's gen_random_uuid()**: standard choice
+  for multi-tenant apps; avoids sequential-ID guessing as an attack vector
+  once real auth/permissions exist.
 
 ## Known technical debt
-- None yet from a code standpoint — this session was pure scaffolding.
-- Process debt: the dev workflow assumption baked into the blueprint (see
-  "Dev workflow decision" above) needs correcting before Session 2 starts
-  writing more files, or every future session will keep defaulting to the
-  slower file-by-file GitHub web UI pattern unnecessarily.
+- **No Row-Level Security yet**: circle-scoping is currently enforced only
+  by the application remembering to filter by circle_id in every query.
+  This is a real gap — Session 2.5 (next) adds a database-level backstop
+  via Postgres RLS specifically so an app-code bug can never leak another
+  family's data. Until then, no application code exists yet that queries
+  this data, so there's no live exposure — but this should not be treated
+  as "done" until Session 2.5 lands.
+- **Package version pinning** (from Session 1): resolved, but a reminder
+  to verify package versions against current docs rather than assuming a
+  remembered version number is current, in future sessions too.
 
 ## Deferred ideas (not built yet, not forgotten)
-- Data model for family circles / users / elders (Session 2+)
-- Auth
-- LINE webhook + LIFF integration
-- Payments via NewebPay
+- Row-Level Security as a database-level backstop (Session 2.5 — next)
+- Auth (Session 3)
+- LINE webhook + LIFF integration (Session 13+)
+- Payments via NewebPay (Session 23+)
 - Migrations story: currently manual SQL run in Neon's console; revisit
-  if the schema grows complex enough that manual tracking becomes error-prone.
+  if schema complexity grows.
 
 ## Security considerations
-- All secrets live only in Vercel env vars, never committed. .env.example
-  documents names only.
-- SQL injection is prevented by consistently using parameterized queries
-  via queryUnsafe(sql, params) — this must be maintained as a hard rule
-  in every future session.
-- LINE webhook signature verification and NewebPay hash verification are
-  not yet implemented — required before either integration goes live.
+- All secrets live only in Vercel env vars (production) and `.env.local`
+  (local dev, gitignored).
+- SQL injection prevented via parameterized queries through
+  `queryUnsafe(sql, params)`.
+- Circle-scoping currently application-level only — see "Known technical
+  debt" above. No RLS yet.
+- LINE webhook signature verification and NewebPay hash verification not
+  yet implemented.
 
 ## Performance considerations
-- Nothing meaningful yet at this scale (one query, one page). Revisit
-  connection/query patterns once the app has real read/write volume.
+- Indexes added on circle_memberships(circle_id), circle_memberships
+  (member_id), and cared_for_profiles(circle_id) — these cover the two
+  lookup directions the app will do constantly ("who's in this circle" /
+  "which circles is this person in") and the common "get this circle's
+  cared-for people" query. Revisit once real query patterns from Session
+  3+ exist.
 
 ## Session log
-- Session 1: Repo scaffold — Next.js App Router + TypeScript project
-  structure, Neon DB helper (queryUnsafe pattern), homepage wiring-check
-  querying SELECT NOW(), .env.example, initial schema.sql (empty)
-  and this ARCHITECTURE.md. Built via GitHub's web UI. Decided mid-session
-  to switch to local VS Code + Git for Session 2 onward — see "Dev workflow
-  decision" above.
+- **Session 1 (complete)**: Repo scaffold, Neon/Vercel/GitHub wiring,
+  local VS Code dev environment.
+- **Session 2 (complete)**: Data model v1 — circles, members,
+  cared_for_profiles, circle_memberships tables with indexes and seed
+  data. Verified via Neon SQL Editor (SELECT * FROM circles; returned the
+  expected seed row).
