@@ -7,8 +7,8 @@ export default async function HomePage() {
   let error: string | null = null;
 
   try {
-    const rows = await queryUnsafe<{ now: string }>('SELECT NOW()');
-    dbTime = rows[0]?.now ?? null;
+    const rows = await queryUnsafe<{ now: Date }>('SELECT NOW()');
+    dbTime = rows[0]?.now ? String(rows[0].now) : null;
   } catch (e) {
     error = e instanceof Error ? e.message : 'Unknown error';
   }
