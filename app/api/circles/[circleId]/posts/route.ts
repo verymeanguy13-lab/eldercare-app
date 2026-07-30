@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { put } from '@vercel/blob';
 import { queryAsMember } from '@/lib/db';
 import { requireCircleMember, AuthError } from '@/lib/require-circle-member';
+import { getPostsForCircle } from '@/lib/posts';
 
 export async function GET(
   req: NextRequest,
@@ -11,17 +12,7 @@ export async function GET(
 
   try {
     const memberId = await requireCircleMember(circleId, 'viewer');
-
-    const posts = await queryAsMember(
-      memberId,
-      `SELECT p.id, p.text, p.photo_url, p.created_at, m.name as author_name
-       FROM posts p
-       JOIN members m ON m.id = p.author_member_id
-       WHERE p.circle_id = $1
-       ORDER BY p.created_at DESC`,
-      [circleId]
-    );
-
+    const posts = await getPostsForCircle(memberId, circleId);
     return NextResponse.json({ posts });
   } catch (e) {
     if (e instanceof AuthError) {
@@ -43,6 +34,7 @@ export async function POST(
     const formData = await req.formData();
     const text = formData.get('text');
     const photo = formData.get('photo') as File | null;
+    const requestedType = formData.get('postType');
 
     if (!text || typeof text !== 'string' || !text.trim()) {
       return NextResponse.json({ error: 'Post text required' }, { status: 400 });
@@ -58,15 +50,25 @@ export async function POST(
       photoPathname = pathname;
     }
 
-    const created = await queryAsMember(
+    // The person's explicit choice always wins. 'photo' is only an
+    // automatic classification for the DEFAULT case — attaching an
+    // image without deliberately picking 小提醒 first.
+    let postType: string = 'status_update';
+    if (requestedType === 'note') {
+      postType = 'note';
+    } else if (photoPathname) {
+      postType = 'photo';
+    }
+
+    await queryAsMember(
       memberId,
-      `INSERT INTO posts (circle_id, author_member_id, text, photo_url)
-       VALUES ($1, $2, $3, $4)
-       RETURNING id, text, photo_url, created_at`,
-      [circleId, memberId, text.trim(), photoPathname]
+      `INSERT INTO posts (circle_id, author_member_id, text, photo_url, post_type)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [circleId, memberId, text.trim(), photoPathname, postType]
     );
 
-    return NextResponse.json({ post: created[0] });
+    const posts = await getPostsForCircle(memberId, circleId);
+    return NextResponse.json({ posts });
   } catch (e) {
     if (e instanceof AuthError) {
       return NextResponse.json({ error: e.message }, { status: e.status });

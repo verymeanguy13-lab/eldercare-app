@@ -64,16 +64,16 @@ CREATE TABLE magic_link_tokens (
 );
 
 -- ============================================================
--- Posts / shared feed (Session 4)
+-- Posts / shared feed (Session 4, extended Session 5)
 -- ============================================================
 CREATE TABLE posts (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   circle_id UUID NOT NULL REFERENCES circles(id) ON DELETE CASCADE,
   author_member_id UUID NOT NULL REFERENCES members(id) ON DELETE CASCADE,
   text TEXT,
-  photo_url TEXT, -- stores a Vercel Blob PATHNAME, not a public URL —
-                   -- private storage; resolved only via the authenticated
-                   -- /api/circles/[circleId]/posts/photo route.
+  photo_url TEXT, -- Blob PATHNAME, not a public URL (Session 4, private storage)
+  post_type TEXT NOT NULL DEFAULT 'status_update'
+    CHECK (post_type IN ('status_update', 'photo', 'note', 'system')),
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -87,6 +87,30 @@ USING (circle_id IN (SELECT my_circle_ids()))
 WITH CHECK (circle_id IN (SELECT my_circle_ids()));
 
 GRANT SELECT, INSERT, UPDATE, DELETE ON posts TO app_user;
+
+-- ============================================================
+-- Reactions (Session 5)
+-- ============================================================
+CREATE TABLE reactions (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  circle_id UUID NOT NULL REFERENCES circles(id) ON DELETE CASCADE,
+  post_id UUID NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+  member_id UUID NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+  emoji TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (post_id, member_id)
+);
+
+CREATE INDEX idx_reactions_post_id ON reactions(post_id);
+
+ALTER TABLE reactions ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY reactions_isolation ON reactions
+FOR ALL
+USING (circle_id IN (SELECT my_circle_ids()))
+WITH CHECK (circle_id IN (SELECT my_circle_ids()));
+
+GRANT SELECT, INSERT, UPDATE, DELETE ON reactions TO app_user;
 
 -- ============================================================
 -- Row-Level Security (Session 2.5)
@@ -154,6 +178,6 @@ WITH CHECK (true);
 -- 1 control-group circle: 'Wang Family' (id 99999999-9999-9999-9999-999999999999)
 -- 2 cared_for_profiles: 陳媽媽, 陳爸爸
 -- 3 members with roles: admin, family_member, caregiver
--- Plus real data created via the actual app: 'Test Family' circle with
--- real posts (text + private photo) created by a real magic-link-
--- authenticated user.
+-- Plus real data via the actual app: 'Test Family' circle with real
+-- posts of all three user-facing types (status_update, note, photo)
+-- and real reactions.
