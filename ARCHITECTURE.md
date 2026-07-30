@@ -1,6 +1,6 @@
 # ARCHITECTURE.md — Eldercare Coordination App
 
-_Last updated: Session 3 (complete)_
+_Last updated: Session 4 (complete)_
 
 ## What this app is
 A Taiwan-focused family elder-care coordination app. Adult children
@@ -9,226 +9,254 @@ coordinate care for elderly parents; parents interact via LINE
 
 ## Stack
 - **Framework**: Next.js (App Router, TypeScript), deployed on Vercel
-- **Database**: Neon Postgres (serverless), accessed via `@neondatabase/serverless`
-  v1.x — no ORM. Two connections: owner-level (`queryUnsafe`, bypasses
-  RLS) and app_user-level (`queryAsMember`, RLS-enforced).
+- **Database**: Neon Postgres, `@neondatabase/serverless` v1.x — no ORM.
+  Two connections: owner-level (queryUnsafe, bypasses RLS) and
+  app_user-level (queryAsMember, RLS-enforced).
 - **Auth**: Passwordless magic link email via Resend. Sessions are random
-  tokens in a `sessions` table, stored in an HTTP-only cookie — no JWTs.
+  tokens in a `sessions` table, HTTP-only cookie.
+- **File storage**: Vercel Blob, PRIVATE access mode (Session 4) —
+  see dedicated section below, this has real implementation implications.
 - **Parent-facing / notifications**: LINE Messaging API + LIFF (Phase 2)
 - **Payments**: NewebPay
 - **Dev workflow**: VS Code locally + PowerShell → GitHub → Vercel auto-deploy.
 - **Repo**: public at github.com/verymeanguy13-lab/eldercare-app.
+- **Vercel CLI now in use** (Session 4) — `vercel login`, `vercel link`,
+  `vercel env pull .env.local` — needed specifically for Blob's OIDC
+  credential flow. This is a genuinely new tool beyond the GitHub-web/VS
+  Code workflow used through Session 3; see "Vercel Blob" section below
+  for why, and why local dev ended up using a static token instead of
+  OIDC despite this setup.
 
 ## Data model
-- **`circles`** — one row per family. `tier` (free/paid), `invite_code`
-  (added Session 3, used for the join flow).
-- **`members`** — one row per real person; `email` now UNIQUE (Session 3),
-  since it's the identity magic-link auth resolves to.
-- **`cared_for_profiles`** — one row per elderly person being cared for;
-  a circle can hold multiple.
-- **`circle_memberships`** — join table, member↔circle with a `role`.
+- **`circles`**, **`members`**, **`cared_for_profiles`**,
+  **`circle_memberships`** — see Session 2/2.5 notes below, unchanged
+  this session.
 - **`sessions`**, **`magic_link_tokens`** (Session 3) — auth bookkeeping,
-  deliberately NOT circle-scoped or RLS-protected (see below).
+  not RLS-protected (see Session 3 notes).
+- **`posts`** (Session 4) — one row per feed post: circle_id,
+  author_member_id, text, photo_url. `photo_url` stores a Blob
+  **pathname** (e.g. `posts/{circleId}/{timestamp}-{filename}`), NOT a
+  usable URL — private blobs have no directly-loadable URL. RLS-protected
+  via the same `my_circle_ids()` pattern as every other circle-scoped
+  table.
 
-## Row-Level Security (Session 2.5, wired into real code in Session 3)
-`queryAsMember(memberId, query, params)` in `lib/db.ts` bundles setting
-`app.current_member_id` and running the actual query into one
-`sql.transaction([...])` call, because Neon's HTTP driver treats each
-`.query()` as an independent request with no memory between calls. This
-is now ACTIVELY used (dashboard's circle list, `requireCircleMember`),
-not just designed-but-unused as it was at the end of Session 2.5.
+## Vercel Blob — private storage (Session 4)
+**Why private, not public**: this app's photos can include genuinely
+sensitive content (a parent in a care setting, medication labels, home
+interiors) — a "public" blob is permanently viewable by anyone who ever
+obtains its URL, no login required, forever. That's an unacceptable
+exposure for this kind of app, so private storage was chosen even though
+it costs real implementation complexity (below), unlike every other
+"just make it work" default in this project so far.
 
-**Deliberate exception**: `app/api/circles/join/route.ts` looks up a
-circle by invite code using the OWNER connection (`queryUnsafe`), not
-`queryAsMember` — because RLS would correctly block seeing a circle
-you're not yet a member of, but the invite code itself is the credential
-proving the right to join. This is intentional, not a bypass of the
-security model.
+**What private storage actually requires, that public wouldn't**:
+1. Files aren't referenceable by a plain `<img src="...">` — they need to
+   be fetched through a route that authenticates the request first, then
+   streams the file back. This is `/api/circles/[circleId]/posts/photo/route.ts`
+   — it calls `requireCircleMember` before ever touching Blob, AND
+   separately validates the requested pathname actually starts with
+   `posts/{circleId}/`, specifically to stop someone who's a legitimate
+   member of circle A from guessing at circle B's photo paths.
+2. Authentication to Vercel Blob itself needs credentials. Vercel's
+   modern approach is OIDC (short-lived, auto-rotating tokens) — this
+   works automatically in production with zero setup, but for LOCAL
+   development, this session hit real, working-as-designed friction:
+   Vercel's per-project OIDC setting wasn't enabled for the "development"
+   environment specifically (separate from Production/Preview), and even
+   after pulling an OIDC token via `vercel env pull`, a stale
+   `VERCEL_OIDC_TOKEN` value sitting in `.env.local` caused the SDK to
+   keep attempting (and failing) OIDC rather than falling back cleanly.
 
-**Auth tables (`sessions`, `magic_link_tokens`) have no RLS** — they're
-not circle-scoped, and access is controlled by possessing the secret
-token itself. They're only ever touched via `queryUnsafe` (owner
-connection), never `queryAsMember`.
+**The decision made**: rather than debug Vercel's per-environment OIDC
+settings further, local development uses a STATIC `BLOB_READ_WRITE_TOKEN`
+(generated from the Blob store's own Tokens page), passed EXPLICITLY via
+`token: process.env.BLOB_READ_WRITE_TOKEN` in both `put()` and `get()`
+calls — rather than relying on the SDK's automatic OIDC detection. This
+was a pragmatic choice given real time already spent, not an ideal one:
+it means local dev's file-storage credential handling is now genuinely
+different from every other secret in this project's local vs. production
+symmetry so far. **Production is unaffected and still gets Vercel's
+automatic, more-secure OIDC handling** — this is purely a local-dev-only
+divergence. Worth knowing if a future session's Blob-related code
+behaves differently locally vs. deployed; check this asymmetry first.
 
-## Auth flow (Session 3)
-1. User submits email at `/login` → `POST /api/auth/request-link`
-   creates a `magic_link_tokens` row, emails a link via Resend.
-2. User clicks link → `GET /api/auth/verify?token=...` validates the
-   token (single-use, 15-min expiry), finds-or-creates a `members` row
-   by email, creates a `sessions` row, sets an HTTP-only cookie, redirects
-   to `/dashboard`.
-3. `lib/current-member.ts`'s `getCurrentMemberId()` reads that cookie and
-   looks up the session on every subsequent request.
-4. `lib/require-circle-member.ts`'s `requireCircleMember(circleId,
-   minRole)` is the reusable gate every future circle-scoped route should
-   call FIRST — it confirms sign-in AND role, using the RLS-protected
-   `queryAsMember` connection, then returns the memberId for the route to
-   use in its own queryAsMember calls.
-5. Role hierarchy (lowest to highest): viewer < caregiver < family_member
-   < admin. `hasRequiredRole()` in the same file does the comparison.
+**Package version note**: `@vercel/blob` needed to be `^2.6.1`, not the
+older version originally specified — same pattern as Session 1's Neon
+package version issue. General lesson reinforced twice now: verify
+package versions against current npm/docs rather than trusting a
+remembered number, especially for any package whose specific feature
+(private storage, in this case) might postdate an older assumed version.
 
-## Circle creation & joining (Session 3)
-- `POST /api/circles` — creates a circle, generates an 8-hex-char invite
-  code, makes the creator `admin`. Uses queryUnsafe (owner) since no
-  circle_id exists to scope by yet at creation time.
-- `POST /api/circles/join` — looks up circle by invite code (owner
-  connection, deliberate RLS exception, see above), checks membership cap
-  via `lib/caps.ts`, inserts a `family_member` row.
-- `lib/caps.ts`'s `checkMemberCap()` does ONLY cap math, not access
-  control — callers must already have a legitimate reason to know the
-  circleId (via requireCircleMember or a validated invite code) before
-  calling it.
+## Auth flow (Session 3, unchanged this session)
+1. `/login` → `POST /api/auth/request-link` → magic_link_tokens row,
+   Resend email.
+2. Click link → `GET /api/auth/verify` → validates token, finds/creates
+   member, creates session, sets cookie, redirects to `/dashboard`.
+   **Cookie's `secure` flag must be `process.env.NODE_ENV === 'production'`,
+   NOT a hardcoded `true`** — a hardcoded `true` silently breaks session
+   persistence over local `http://localhost` (browsers won't
+   store/send `secure` cookies over plain HTTP). This was a real bug hit
+   and fixed in Session 4's testing, even though the code itself
+   originated in Session 3.
+3. `getCurrentMemberId()` reads the cookie each request.
+4. `requireCircleMember(circleId, minRole)` — the gate every circle-scoped
+   route calls first.
+
+## Circle creation & joining (Session 3, unchanged this session)
+- `POST /api/circles`, `POST /api/circles/join` — see Session 3 notes.
+- Free-tier cap logic (lib/caps.ts) unit-tested but still NOT verified
+  end-to-end with genuinely separate real accounts — see "Known technical
+  debt" below, unchanged from Session 3.
+
+## Posts / feed (Session 4)
+- `GET/POST /api/circles/[circleId]/posts` — list/create posts.
+  `requireCircleMember(circleId, 'viewer')` gates both; any circle member
+  (any role) can post and view.
+- `GET /api/circles/[circleId]/posts/photo?pathname=...` — the
+  authenticated photo-serving route described above.
+- `/circles/[circleId]/feed` — the actual feed page (server component
+  fetches via queryAsMember, passes to a client component for the
+  post/upload form).
+- **Answering the "no client-supplied circleId alone determines access"
+  question explicitly, since it's a recurring design principle**: circleId
+  comes from the URL, but every route call is preceded by
+  requireCircleMember, which checks real circle_memberships via the
+  RLS-protected connection — verified in this session via direct URL
+  tampering to an unrelated circle (Wang Family, Session 2.5's control
+  group), which correctly redirected to /dashboard rather than exposing
+  anything.
 
 ## Repo structure so far
-- app/layout.tsx, app/globals.css, app/page.tsx
-- app/login/page.tsx — magic link request form
-- app/dashboard/page.tsx (server) + dashboard-client.tsx (client) —
-  circle list, create/join forms
-- app/api/auth/request-link, verify, logout — auth routes
-- app/api/circles, circles/join — circle management routes
-- lib/db.ts — queryUnsafe (owner) + queryAsMember (RLS-enforced)
-- lib/auth.ts — magic link + session token logic
-- lib/current-member.ts — reads session cookie → memberId
-- lib/require-circle-member.ts — requireCircleMember gate + role hierarchy
-- lib/caps.ts — free-tier member cap logic (extended in Session 24)
-- tests/require-circle-member.test.ts, tests/caps.test.ts — Vitest unit
-  tests for the pure-logic pieces (role comparison, cap math)
+- app/layout.tsx, globals.css, page.tsx
+- app/login/page.tsx
+- app/dashboard/page.tsx + dashboard-client.tsx
+- app/circles/[circleId]/feed/page.tsx + feed-client.tsx (Session 4)
+- app/api/auth/request-link, verify, logout
+- app/api/circles, circles/join
+- app/api/circles/[circleId]/posts/route.ts (Session 4)
+- app/api/circles/[circleId]/posts/photo/route.ts (Session 4)
+- lib/db.ts — queryUnsafe + queryAsMember
+- lib/auth.ts, current-member.ts, require-circle-member.ts, caps.ts
+- tests/require-circle-member.test.ts, caps.test.ts
 - schema.sql, ARCHITECTURE.md, .env.example, .env.local (gitignored)
 - .gitignore, next.config.mjs, package.json, tsconfig.json, README.md
 
 ## Conventions to keep consistent in every future session
-- DB access: queryUnsafe (owner, bypasses RLS — auth/admin/invite-lookup
-  only) vs queryAsMember (app_user, RLS-enforced — all circle-scoped data
-  once a member is known). Getting this wrong in either direction is a
-  real security bug, not just a style issue.
-- Every circle-scoped route should call requireCircleMember() FIRST, then
-  use the memberId it returns for queryAsMember calls.
-- Components: default to Server Components; 'use client' only where
-  interactivity is genuinely needed (forms, buttons with handlers).
-- File delivery: only files that changed, given in full.
-- Path alias: @/ maps to the repo root.
-- Non-string/number Postgres values (e.g. Date) must be explicitly
-  converted before rendering in JSX.
-- Primary keys are UUIDs throughout.
-- Pure logic (role comparisons, cap math) lives in small, dependency-free
-  functions (hasRequiredRole, isWithinMemberCap) separate from the
-  DB-querying wrapper functions around them, specifically so they're
-  unit-testable with Vitest without needing a real database connection.
+- DB access: queryUnsafe (owner) vs queryAsMember (RLS-enforced) — see
+  Session 3 notes, unchanged.
+- Every circle-scoped route calls requireCircleMember FIRST.
+- Every NEW circle-scoped table needs: a circle_id column, an RLS policy
+  via my_circle_ids(), AND an explicit GRANT to app_user — this last step
+  is easy to forget (it's not automatic) and was called out explicitly
+  in Session 4's migration for exactly that reason.
+- Files/photos: if ever storing something genuinely private, default to
+  Blob's `access: 'private'` and build an authenticated serving route —
+  do not default to 'public' for convenience. This session's extra
+  complexity was a deliberate, justified tradeoff, not something to avoid
+  next time similar data shows up (e.g. documents in a later session).
+- Session cookies: `secure` must be environment-conditional, never a
+  hardcoded `true`, or local testing silently breaks.
+- Components: default Server Components; 'use client' only where needed.
+- Path alias: @/ maps to repo root. Primary keys: UUIDs throughout.
 
 ## Environment variables
 | Variable | Where | Purpose |
 |---|---|---|
-| `NEON_DATABASE_URL` | Vercel + `.env.local` | Owner connection (queryUnsafe) |
-| `NEON_APP_USER_DATABASE_URL` | Vercel + `.env.local` | app_user connection (queryAsMember, RLS-enforced) |
-| `RESEND_API_KEY` | Vercel + `.env.local` | Sends magic link emails |
-| `NEXT_PUBLIC_APP_URL` | Vercel + `.env.local` | Base URL for magic link generation — MUST differ between local (`http://localhost:3000`) and production (real Vercel URL); mixing these up breaks the login flow (see Known technical debt) |
+| `NEON_DATABASE_URL` | Vercel + `.env.local` | Owner connection |
+| `NEON_APP_USER_DATABASE_URL` | Vercel + `.env.local` | app_user connection (RLS) |
+| `RESEND_API_KEY` | Vercel + `.env.local` | Magic link emails |
+| `NEXT_PUBLIC_APP_URL` | Vercel + `.env.local` | MUST differ: localhost locally, real URL in prod |
+| `BLOB_READ_WRITE_TOKEN` | `.env.local` only (Session 4) | Static fallback token for LOCAL Blob access — NOT used in production, which relies on automatic OIDC instead |
+| `BLOB_STORE_ID`, `BLOB_WEBHOOK_PUBLIC_KEY` | Vercel + `.env.local` | Auto-provisioned with the Blob store; not directly used by current code but harmless to keep |
+| `VERCEL_OIDC_TOKEN` | `.env.local` (from `vercel env pull`) | Present but NOT actually relied upon by current code — see Vercel Blob section for why the static token is used instead |
 | `LINE_CHANNEL_SECRET` / `LINE_CHANNEL_ACCESS_TOKEN` | same | Session 13+ |
 | `NEWEBPAY_MERCHANT_ID` / `HASH_KEY` / `HASH_IV` | same | Session 23+ |
 
 ## Where are my secrets (running list)
 - Neon dashboard: connection strings, app_user role password
-- Resend dashboard: API key (shared account across this + another
-  project — each project has its own separately-named key)
-- Vercel dashboard: all environment variables
+- Resend dashboard: API key (shared account, separately-named key)
+- Vercel dashboard: env vars; Blob store's own Tokens page (the static
+  BLOB_READ_WRITE_TOKEN specifically — separate from the main project
+  Environment Variables page)
 - GitHub: source code (public repo)
 
 ## LINE channel note (relevant from Session 13 onward)
-This app needs its OWN separate LINE Provider + Messaging API channel,
-distinct from other existing projects.
+This app needs its OWN separate LINE Provider + Messaging API channel.
 
 ## Design decisions & reasoning
-- **Magic link over passwords or NextAuth**: no password storage/reset
-  burden for a non-technical family user base; avoids fighting NextAuth's
-  ORM-shaped adapter expectations against this project's hand-rolled
-  schema. Costs: an email-sending dependency (Resend) and a slightly
-  unusual session mechanism to understand, versus a more "standard" but
-  heavier auth library.
-- **Sessions as plain DB tokens, not JWTs**: same reasoning as no-ORM
-  elsewhere in this project — a database lookup is a pattern already used
-  everywhere else, versus introducing JWT signing/verification as a new
-  concept.
-- **Two separate DB connections (owner vs app_user)**: RLS (Session 2.5)
-  only applies to non-owner roles; queryAsMember is how that protection
-  actually gets used by real application code.
-- **Invite-code join deliberately bypasses RLS**: the code IS the
-  credential; this is documented explicitly in both this file and the
-  route's own code comment specifically so a future session doesn't
-  "fix" it into requireCircleMember and break the join flow entirely
-  (you can't require membership in the circle you're trying to join).
-- **checkMemberCap does cap math only, not access control**: keeps a
-  single responsibility per function; access control lives in
-  requireCircleMember or the invite-code check, not duplicated into caps.ts.
+- Magic link over passwords/NextAuth, sessions as DB tokens not JWTs,
+  two DB connections, invite-code RLS exception, cap-checking separated
+  from access control — all unchanged from Session 3, see prior log.
+- **Private Blob storage over public**: see dedicated section above —
+  the single largest design decision and largest source of real
+  implementation friction this session, made deliberately given the
+  sensitivity of family care photos.
+- **Static token over OIDC for local dev specifically**: pragmatic,
+  time-boxed decision given real friction hit; NOT a judgment that OIDC
+  is wrong — production still uses it. A future session could revisit
+  properly enabling OIDC for the development environment if the token
+  rotation hassle becomes annoying, but it's not urgent.
 
 ## Known technical debt
-- **Resend's shared testing address (`onboarding@resend.dev`) can only
-  send to the ONE email address registered on the Resend account itself**
-  — not just "your own domain," the literal single address. This meant
-  Session 3 could NOT fully test the join-flow and free-tier cap (3
-  members) with genuinely separate accounts; only the "already a member"
-  rejection path was verified with a real second login. A verified
-  sending domain (natural to set up alongside Session 13's LINE work,
-  since that also benefits from professional branding) is needed before
-  real multi-user testing — or before any real family uses this app, full
-  stop.
-- **Free-tier member cap (3) is unverified in practice**, though the pure
-  logic (isWithinMemberCap) IS unit-tested via Vitest — the gap is
-  specifically the end-to-end route behavior with real distinct accounts,
-  not the underlying math.
-- **NEXT_PUBLIC_APP_URL must be manually kept different between
-  `.env.local` (localhost) and Vercel (production)** — this caused a real
-  bug this session (a magic link generated locally pointed at production,
-  404ing). Worth double-checking this value specifically anytime login
-  links misbehave in the future.
-- **Invite codes are short** (8 hex characters, 32 bits) — fine for
-  testing, worth lengthening or rate-limiting the join endpoint before
-  real families use this, since it's currently guessable at scale.
-- **Package version pinning** (Session 1): resolved.
+- **Local Blob auth uses a static long-lived token, diverging from
+  production's OIDC** — see Vercel Blob section. Low urgency (local-only,
+  doesn't affect production security posture) but worth remembering as
+  an asymmetry.
+- **Resend's single-recipient testing restriction** (Session 3) — still
+  unresolved; free-tier cap still unverified end-to-end with real
+  separate accounts. A verified sending domain would fix both this AND
+  unlock proper OIDC trust configuration questions later, so there's a
+  case for prioritizing it.
+- **Invite codes are short** (Session 3) — unresolved.
+- **Free-tier cap hardcoded constant** (Session 3) — unresolved, deferred
+  to Session 24 as planned.
+- **Package version pinning** — TWICE now (Neon in Session 1, Blob in
+  Session 4) a specified version predated a feature the code needed.
+  Worth treating this as a standing pattern: after adding ANY new
+  package this project hasn't used before, a quick "is this the current
+  version, and does it support the specific feature I'm using" check is
+  cheap insurance against losing a debugging session to it.
 
 ## Deferred ideas (not built yet, not forgotten)
-- Verified Resend sending domain — needed for both real deliverability
-  and to unblock full multi-account testing (natural to pair with
-  Session 13)
+- Verified Resend sending domain (Session 13-ish, or sooner per Session
+  3's Health Check note)
+- Properly scoping OIDC to the development environment (optional
+  cleanup, not urgent)
 - LINE webhook + LIFF integration (Session 13+)
 - Payments via NewebPay (Session 23+)
 - Migrations story: currently manual SQL run in Neon's console.
-- Pulling the free-tier cap number out of caps.ts's hardcoded constant
-  into config/a tier table (Session 24, when billing exists)
+- Cap constant → config/tier table (Session 24)
 
 ## Security considerations
-- Two real layers of circle isolation now BOTH active: RLS (database,
-  proven in 2.5) AND application-level requireCircleMember (Session 3).
-  The queryAsMember/queryUnsafe split is the load-bearing convention that
-  keeps this working — see "Conventions" above.
-- Sessions: HTTP-only, secure, sameSite=lax cookies; 30-day expiry;
-  magic link tokens: single-use, 15-minute expiry.
+- RLS + requireCircleMember, both active (Session 3), now also covering
+  `posts` (Session 4).
+- Private Blob storage with an authenticated serving route + explicit
+  pathname-prefix validation — see Vercel Blob section.
+- Sessions: HTTP-only, environment-conditional secure flag, sameSite=lax,
+  30-day expiry. Magic links: single-use, 15-minute expiry.
 - SQL injection prevented via parameterized queries throughout.
-- Invite codes are the join credential — see "Known technical debt" re:
-  length/rate-limiting before real use.
-- LINE webhook signature verification and NewebPay hash verification not
-  yet implemented.
-- **A real secret (Resend API key) and a real DB password were pasted
-  into this Claude conversation during debugging.** Recommended: rotate
-  both (new Resend API key + `ALTER ROLE app_user PASSWORD '...'` in
-  Neon) before this app handles any real family's data — not urgent
-  today, but shouldn't be forgotten indefinitely either.
+- A real secret (Resend API key) and DB password were pasted into this
+  chat during Session 3 debugging — rotation still recommended, still
+  not done, still not urgent but shouldn't be forgotten indefinitely.
 
 ## Performance considerations
-- Indexes on circle_memberships(circle_id), circle_memberships(member_id),
-  cared_for_profiles(circle_id).
-- RLS policies use a SECURITY DEFINER helper function (my_circle_ids())
-  rather than inline subqueries, both for correctness (avoids recursion)
-  and to keep query plans predictable — worth an EXPLAIN ANALYZE pass
-  once real data volume exists.
+- Index on posts(circle_id, created_at DESC) — matches the feed's actual
+  query pattern (all posts for one circle, newest first).
+- Other indexes unchanged from Session 2/2.5.
 
 ## Session log
 - **Session 1 (complete)**: Repo scaffold, Neon/Vercel/GitHub wiring,
   local VS Code dev environment.
 - **Session 2 (complete)**: Data model v1.
-- **Session 2.5 (complete)**: Row-Level Security, designed and proven via
-  direct SQL testing (not yet wired into application code).
-- **Session 3 (complete)**: Magic link auth (Resend), sessions, circle
-  creation, invite-code join flow, free-tier member cap (logic verified
-  via unit tests; full end-to-end multi-account test blocked by Resend's
-  single-recipient testing restriction — flagged as technical debt).
-  queryAsMember wired into real routes for the first time, activating
-  Session 2.5's RLS design in actual application code.
+- **Session 2.5 (complete)**: Row-Level Security, designed and proven.
+- **Session 3 (complete)**: Magic link auth, sessions, circle
+  creation/joining, queryAsMember wired into real routes for the first
+  time.
+- **Session 4 (complete)**: Shared feed with text + private photo posts.
+  Real, hard-won implementation of private Vercel Blob storage
+  (authenticated serving route, pathname validation, static-token local
+  auth as a pragmatic OIDC workaround). Fixed a real Session-3-origin bug
+  (hardcoded `secure: true` cookie flag breaking local session
+  persistence) discovered during this session's testing. Verified
+  end-to-end: posting, photo display, and cross-circle access denial via
+  direct URL tampering.

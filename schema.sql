@@ -7,7 +7,6 @@
 
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
--- One row per family circle
 CREATE TABLE circles (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   name TEXT NOT NULL,
@@ -16,7 +15,6 @@ CREATE TABLE circles (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- One row per real person (not the cared-for elder themselves)
 CREATE TABLE members (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   name TEXT NOT NULL,
@@ -25,8 +23,6 @@ CREATE TABLE members (
 );
 ALTER TABLE members ADD CONSTRAINT members_email_unique UNIQUE (email);
 
--- One row per elderly parent/relative being cared for.
--- A circle can have MULTIPLE cared_for_profiles (e.g. both parents).
 CREATE TABLE cared_for_profiles (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   circle_id UUID NOT NULL REFERENCES circles(id) ON DELETE CASCADE,
@@ -36,8 +32,6 @@ CREATE TABLE cared_for_profiles (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- Join table: connects members to circles, with a role per connection.
--- A member can belong to more than one circle (one row per circle).
 CREATE TABLE circle_memberships (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   circle_id UUID NOT NULL REFERENCES circles(id) ON DELETE CASCADE,
@@ -54,10 +48,6 @@ CREATE INDEX idx_cared_for_profiles_circle_id ON cared_for_profiles(circle_id);
 -- ============================================================
 -- Auth (Session 3)
 -- ============================================================
--- Auth bookkeeping tables. Deliberately NOT circle-scoped, so NOT
--- covered by RLS — access is controlled by possessing the secret
--- token itself, and these are only ever touched via the owner-level
--- connection (queryUnsafe), never queryAsMember.
 CREATE TABLE sessions (
   token TEXT PRIMARY KEY,
   member_id UUID NOT NULL REFERENCES members(id) ON DELETE CASCADE,
@@ -74,14 +64,38 @@ CREATE TABLE magic_link_tokens (
 );
 
 -- ============================================================
+-- Posts / shared feed (Session 4)
+-- ============================================================
+CREATE TABLE posts (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  circle_id UUID NOT NULL REFERENCES circles(id) ON DELETE CASCADE,
+  author_member_id UUID NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+  text TEXT,
+  photo_url TEXT, -- stores a Vercel Blob PATHNAME, not a public URL —
+                   -- private storage; resolved only via the authenticated
+                   -- /api/circles/[circleId]/posts/photo route.
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_posts_circle_id_created_at ON posts(circle_id, created_at DESC);
+
+ALTER TABLE posts ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY posts_isolation ON posts
+FOR ALL
+USING (circle_id IN (SELECT my_circle_ids()))
+WITH CHECK (circle_id IN (SELECT my_circle_ids()));
+
+GRANT SELECT, INSERT, UPDATE, DELETE ON posts TO app_user;
+
+-- ============================================================
 -- Row-Level Security (Session 2.5)
 -- ============================================================
 -- CREATE ROLE app_user LOGIN PASSWORD '<see password manager>';
 -- GRANT SELECT, INSERT, UPDATE, DELETE ON circles, members,
 --   cared_for_profiles, circle_memberships TO app_user;
 -- GRANT app_user TO neondb_owner;
--- (one-time statement, commented out — re-running would error on an
--- existing database; kept here for reference on a fresh database only)
+-- (one-time statement, commented out — kept for reference only)
 
 ALTER TABLE circles ENABLE ROW LEVEL SECURITY;
 ALTER TABLE cared_for_profiles ENABLE ROW LEVEL SECURITY;
@@ -140,5 +154,6 @@ WITH CHECK (true);
 -- 1 control-group circle: 'Wang Family' (id 99999999-9999-9999-9999-999999999999)
 -- 2 cared_for_profiles: 陳媽媽, 陳爸爸
 -- 3 members with roles: admin, family_member, caregiver
--- Plus real data created via Session 3's UI: a 'Test Family' circle,
--- created through the actual app by a real magic-link-authenticated user.
+-- Plus real data created via the actual app: 'Test Family' circle with
+-- real posts (text + private photo) created by a real magic-link-
+-- authenticated user.
